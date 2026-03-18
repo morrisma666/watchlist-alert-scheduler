@@ -1,0 +1,87 @@
+name: Dispatch Watchlist Alert
+
+on:
+  schedule:
+    - cron: "45 22 * * 1-5"
+    - cron: "45 23 * * 1-5"
+  workflow_dispatch:
+
+jobs:
+  dispatch:
+    runs-on: ubuntu-latest
+    env:
+      TARGET_OWNER: morrisma666
+      TARGET_REPO: watchlist-daily-alerts
+      TARGET_WORKFLOW_ID: "246839687"
+      TARGET_REF: main
+      TARGET_PAT: ${{ secrets.TARGET_PAT }}
+    steps:
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install pandas-market-calendars
+
+      - name: Gate by US trading day and 18:45 ET
+        id: gate
+        run: |
+          python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from zoneinfo import ZoneInfo
+
+          import pandas_market_calendars as mcal
+
+          now_et = datetime.now(timezone.utc).astimezone(ZoneInfo("America/New_York"))
+          now_cn = datetime.now(timezone.utc).astimezone(ZoneInfo("Asia/Shanghai"))
+          today = now_et.date().isoformat()
+          calendar = mcal.get_calendar("NYSE")
+          is_trading_day = not calendar.schedule(start_date=today, end_date=today).empty
+          in_target_window = (
+            (now_et.hour == 18 and now_et.minute >= 45)
+            or (now_et.hour == 19 and now_et.minute <= 5)
+          )
+          should_dispatch = now_et.weekday() < 5 and is_trading_day and in_target_window
+
+          with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
+            handle.write(f"should_dispatch={'true' if should_dispatch else 'false'}\n")
+            handle.write(f"now_et={now_et.isoformat()}\n")
+            handle.write(f"now_cn={now_cn.isoformat()}\n")
+            handle.write(f"is_trading_day={'true' if is_trading_day else 'false'}\n")
+            handle.write(f"in_target_window={'true' if in_target_window else 'false'}\n")
+
+          print(
+            json.dumps(
+              {
+                "now_et": now_et.isoformat(),
+                "now_cn": now_cn.isoformat(),
+                "is_trading_day": is_trading_day,
+                "in_target_window": in_target_window,
+                "should_dispatch": should_dispatch,
+              }
+            )
+          )
+          PY
+
+      - name: Log schedule context
+        run: |
+          echo "now_et=${{ steps.gate.outputs.now_et }}"
+          echo "now_cn=${{ steps.gate.outputs.now_cn }}"
+          echo "is_trading_day=${{ steps.gate.outputs.is_trading_day }}"
+          echo "in_target_window=${{ steps.gate.outputs.in_target_window }}"
+          echo "should_dispatch=${{ steps.gate.outputs.should_dispatch }}"
+
+      - name: Dispatch private workflow
+        if: github.event_name == 'workflow_dispatch' || steps.gate.outputs.should_dispatch == 'true'
+        run: |
+          curl --fail-with-body \
+            -X POST \
+            -H "Authorization: Bearer $TARGET_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/$TARGET_OWNER/$TARGET_REPO/actions/workflows/$TARGET_WORKFLOW_ID/dispatches \
+            -d "{\"ref\":\"$TARGET_REF\"}"
