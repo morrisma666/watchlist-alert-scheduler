@@ -2,9 +2,13 @@ name: Dispatch Watchlist Alert
 
 on:
   schedule:
-    - cron: "45 22 * * 1-5"
-    - cron: "45 23 * * 1-5"
+    - cron: "45,50,55 22 * * 1-5"
+    - cron: "0,5 23 * * 1-5"
   workflow_dispatch:
+
+concurrency:
+  group: dispatch-watchlist-alert
+  cancel-in-progress: false
 
 jobs:
   dispatch:
@@ -32,7 +36,9 @@ jobs:
           python - <<'PY'
           import json
           import os
-          from datetime import datetime, timezone
+          import urllib.error
+          import urllib.request
+          from datetime import datetime, time, timezone
           from zoneinfo import ZoneInfo
 
           import pandas_market_calendars as mcal
@@ -42,11 +48,54 @@ jobs:
           today = now_et.date().isoformat()
           calendar = mcal.get_calendar("NYSE")
           is_trading_day = not calendar.schedule(start_date=today, end_date=today).empty
+          window_start = time(18, 45)
+          window_end = time(19, 5)
           in_target_window = (
-            (now_et.hour == 18 and now_et.minute >= 45)
-            or (now_et.hour == 19 and now_et.minute <= 5)
+            window_start <= now_et.timetz().replace(tzinfo=None) <= window_end
           )
-          should_dispatch = now_et.weekday() < 5 and is_trading_day and in_target_window
+          threshold_et = datetime.combine(now_et.date(), time(18, 30), tzinfo=ZoneInfo("America/New_York"))
+          threshold_utc = threshold_et.astimezone(timezone.utc)
+
+          already_dispatched = False
+          recent_run = None
+          url = (
+            f"https://api.github.com/repos/{os.environ['TARGET_OWNER']}/"
+            f"{os.environ['TARGET_REPO']}/actions/runs?event=workflow_dispatch&per_page=20"
+          )
+          request = urllib.request.Request(
+            url,
+            headers={
+              "Authorization": f"Bearer {os.environ['TARGET_PAT']}",
+              "Accept": "application/vnd.github+json",
+              "User-Agent": "watchlist-alert-scheduler",
+            },
+          )
+          try:
+            with urllib.request.urlopen(request) as response:
+              payload = json.load(response)
+            for run in payload.get("workflow_runs", []):
+              created_at = datetime.fromisoformat(run["created_at"].replace("Z", "+00:00"))
+              if created_at >= threshold_utc:
+                recent_run = {
+                  "id": run["id"],
+                  "event": run["event"],
+                  "status": run["status"],
+                  "conclusion": run["conclusion"],
+                  "created_at": run["created_at"],
+                }
+                already_dispatched = True
+                break
+          except urllib.error.HTTPError as exc:
+            recent_run = {"error": f"http_{exc.code}"}
+          except Exception as exc:  # pragma: no cover
+            recent_run = {"error": type(exc).__name__}
+
+          should_dispatch = (
+            now_et.weekday() < 5
+            and is_trading_day
+            and in_target_window
+            and not already_dispatched
+          )
 
           with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as handle:
             handle.write(f"should_dispatch={'true' if should_dispatch else 'false'}\n")
@@ -54,6 +103,8 @@ jobs:
             handle.write(f"now_cn={now_cn.isoformat()}\n")
             handle.write(f"is_trading_day={'true' if is_trading_day else 'false'}\n")
             handle.write(f"in_target_window={'true' if in_target_window else 'false'}\n")
+            handle.write(f"already_dispatched={'true' if already_dispatched else 'false'}\n")
+            handle.write(f"threshold_utc={threshold_utc.isoformat()}\n")
 
           print(
             json.dumps(
@@ -62,6 +113,9 @@ jobs:
                 "now_cn": now_cn.isoformat(),
                 "is_trading_day": is_trading_day,
                 "in_target_window": in_target_window,
+                "already_dispatched": already_dispatched,
+                "threshold_utc": threshold_utc.isoformat(),
+                "recent_run": recent_run,
                 "should_dispatch": should_dispatch,
               }
             )
@@ -74,6 +128,8 @@ jobs:
           echo "now_cn=${{ steps.gate.outputs.now_cn }}"
           echo "is_trading_day=${{ steps.gate.outputs.is_trading_day }}"
           echo "in_target_window=${{ steps.gate.outputs.in_target_window }}"
+          echo "already_dispatched=${{ steps.gate.outputs.already_dispatched }}"
+          echo "threshold_utc=${{ steps.gate.outputs.threshold_utc }}"
           echo "should_dispatch=${{ steps.gate.outputs.should_dispatch }}"
 
       - name: Dispatch private workflow
